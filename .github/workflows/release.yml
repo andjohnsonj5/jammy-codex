@@ -1,0 +1,120 @@
+name: Build Codex for Ubuntu 22.04
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TERM_COLOR: always
+      GIT_TERMINAL_PROMPT: 0
+
+    steps:
+      - name: Check out jammy-codex
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev jq curl
+
+      - name: Resolve latest stable Codex release
+        id: codex_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/openai/codex/releases/latest --jq '.tag_name')"
+          if [[ -z "${tag}" ]]; then
+            echo "Failed to resolve upstream release tag" >&2
+            exit 1
+          fi
+
+          if [[ "${tag}" == *alpha* || "${tag}" == *beta* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream tag ${tag} looks pre-release; skipping."
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        if: steps.codex_release.outputs.skip != 'true'
+        id: existing_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.codex_release.outputs.tag }}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${tag} already present; skipping build."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip because release exists
+        if: steps.codex_release.outputs.skip != 'true' && steps.existing_release.outputs.exists == 'true'
+        run: echo "Nothing to do; artifacts already published for this tag."
+
+      - name: Fetch Codex source
+        if: steps.codex_release.outputs.skip != 'true' && steps.existing_release.outputs.exists != 'true'
+        env:
+          GIT_TERMINAL_PROMPT: 0
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.codex_release.outputs.tag }}" https://github.com/openai/codex.git codex
+
+      - name: Install Rust 1.90
+        if: steps.codex_release.outputs.skip != 'true' && steps.existing_release.outputs.exists != 'true'
+        uses: dtolnay/rust-toolchain@1.90
+
+      - name: Restore Rust cache
+        if: steps.codex_release.outputs.skip != 'true' && steps.existing_release.outputs.exists != 'true'
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: codex/codex-rs -> codex/codex-rs/target
+
+      - name: Build Codex binaries
+        if: steps.codex_release.outputs.skip != 'true' && steps.existing_release.outputs.exists != 'true'
+        working-directory: codex/codex-rs
+        run: |
+          set -euo pipefail
+          cargo build --release --bin codex --bin codex-responses-api-proxy
+
+      - name: Package artifacts
+        if: steps.codex_release.outputs.skip != 'true' && steps.existing_release.outputs.exists != 'true'
+        working-directory: codex/codex-rs/target/release
+        run: |
+          set -euo pipefail
+          tag="${{ steps.codex_release.outputs.tag }}"
+          artifact_dir="${GITHUB_WORKSPACE}/artifacts"
+          package="codex-${tag}-ubuntu-22.04-x86_64-gnu.tar.gz"
+          mkdir -p "${artifact_dir}"
+          tar czf "${artifact_dir}/${package}" codex codex-responses-api-proxy
+          (
+            cd "${artifact_dir}"
+            sha256sum "${package}" > SHA256SUMS.txt
+          )
+
+      - name: Publish release artifacts
+        if: steps.codex_release.outputs.skip != 'true' && steps.existing_release.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.codex_release.outputs.tag }}"
+          gh release create "${tag}" \
+            "${GITHUB_WORKSPACE}/artifacts/codex-${tag}-ubuntu-22.04-x86_64-gnu.tar.gz" \
+            "${GITHUB_WORKSPACE}/artifacts/SHA256SUMS.txt" \
+            --title "Codex ${tag} (Ubuntu 22.04 GNU)" \
+            --notes "Automated build from openai/codex ${tag} on ubuntu-22.04 (glibc)."
+
